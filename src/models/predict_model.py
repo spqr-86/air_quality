@@ -1,40 +1,55 @@
-from typing import Dict
+import json
+from typing import Tuple
 
-import pandas as pd
-from sklearn.impute import KNNImputer
-from sklearn.metrics import mean_absolute_error
-from sklearn.model_selection import train_test_split
+import numpy as np
+from shapely.geometry import Point, Polygon, shape
+from sklearn.neighbors import KNeighborsRegressor
 
 
-def calculate_mae_for_nearest_station(df: pd.core.frame.DataFrame,
-                                      target: str) -> Dict[str, float]:
-    """Create a nearest neighbor model and run it on your test data.
+def predict_on_bogota(
+        model: KNeighborsRegressor,
+        n_points: int = 64
+) -> Tuple[np.ndarray, float, float]:
+    """Creates a grid of predicted pollutant values based on the neighboring
+    stations.
 
     Args:
-        df (pd.core.frame.DataFrame): The dataframe
-        target (str): The chosen pollutant for which it plots the distribution
+        model (KNeighborsRegressor): Model to use
+        n_points (int): number of points in the grid
+
+    Returns:
+        predictions_xy (np.ndarray): array containing tuples of coordinates
+        and predicted value
+
+        dlat (float): latitude size of grid
+        dlon (float): longitudinal size of grid
 
     """
-    df2 = df.dropna(inplace=False)
-    df2.insert(0, 'time_discriminator', (
-        df2['DateTime'].dt.dayofyear * 100000 + df2[
-            'DateTime'].dt.hour * 100).values, True)
+    with open('data/bogota.json') as f:
+        js = json.load(f)
 
-    train_df, test_df = train_test_split(df2, test_size=0.2, random_state=57)
+    # Check each polygon to see if it contains the point
+    polygon = Polygon(shape(js['features'][0]['geometry']))
+    (lon_min, lat_min, lon_max, lat_max) = polygon.bounds
 
-    imputer = KNNImputer(n_neighbors=1)
-    imputer.fit(
-        train_df[['time_discriminator', 'Latitude', 'Longitude', target]])
+    dlat = (lat_max - lat_min) / (n_points - 1)
+    dlon = (lon_max - lon_min) / (n_points - 1)
+    lat_values = np.linspace(lat_min - dlat, lat_max + dlat, n_points)
+    lon_values = np.linspace(lon_min - dlon, lon_max + dlon, n_points)
+    xv, yv = np.meshgrid(lat_values, lon_values, indexing='xy')
 
-    # regression_scores = {}
+    predictions_xy = []
 
-    y_test = test_df[target].values
+    for i in range(n_points):
+        # row = [0] * n_points
+        for j in range(n_points):
+            if polygon.contains(Point(lon_values[j], lat_values[i])):
+                point = [lat_values[i], lon_values[j]]
+                # Remove the data of the same station
+                pred = model.predict([point])
+                predictions_xy.append(
+                    [lat_values[i], lon_values[j], pred[0][0]])
 
-    test_df2 = test_df.copy()
-    test_df2.loc[test_df.index, target] = float('NAN')
+    predictions_xy = np.array(predictions_xy)
 
-    y_pred = imputer.transform(
-        test_df2[['time_discriminator', 'Latitude', 'Longitude', target]]
-    )[:, 3]
-
-    return {'MAE': mean_absolute_error(y_pred, y_test)}
+    return predictions_xy, dlat, dlon

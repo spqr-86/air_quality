@@ -1,9 +1,10 @@
 import base64
+import json
 import math
 import re
 from collections import defaultdict
 from datetime import datetime
-from typing import List
+from typing import Any, Dict, List, Optional, Tuple
 
 import folium
 import ipywidgets as widgets
@@ -15,12 +16,16 @@ import tensorflow as tf
 from colour import Color
 from ipywidgets import interact
 from mpl_toolkits.axes_grid1 import make_axes_locatable
+from shapely.geometry import Point, Polygon, shape
 from sklearn.impute import KNNImputer
+from sklearn.neighbors import KNeighborsRegressor
 from sklearn.preprocessing import StandardScaler
 
 FONT_SIZE_TICKS = 12
 FONT_SIZE_TITLE = 20
 FONT_SIZE_AXES = 16
+
+FACTOR = 1.032
 
 # This is a list of categorical variables
 categorical_variables = ['Station']
@@ -39,7 +44,23 @@ def create_correlation_matrix(
         features_list (List[str]): List of features to include in the plot.
 
     """
-    plt.figure(figsize=(10, 10))
+    # Validate features_list to ensure all features are in raw_data
+    valid_features = [feature for feature in features_list if feature
+                      in raw_data.columns]
+
+    # Handling case when some features are not found in the data
+    if len(valid_features) != len(features_list):
+        missing_features = set(features_list) - set(valid_features)
+        print(
+            f"Warning: Some features not found in the data and will "
+            f"be ignored: {missing_features}")
+
+    # Adjusting figure size based on the number of valid features for
+    # better readability
+    plt.figure(figsize=(max(8, len(valid_features)),
+                        max(8, len(valid_features))
+                        )
+               )
     sns.heatmap(
         raw_data[features_list].corr(),
         square=True,
@@ -47,7 +68,7 @@ def create_correlation_matrix(
         cbar=False,
         cmap='RdBu',
         vmin=-1,
-        vmax=1
+        vmax=1,
     )
     plt.title('Correlation Matrix of Variables')
 
@@ -410,15 +431,16 @@ def create_map_with_plots(
 
 
 def plot_distribution_of_gaps(df: pd.core.frame.DataFrame, target: str):
-    """Plots the distribution of the gap sizes in the dataframe
+    """Plots the distribution of the gap sizes in the dataframe.
 
     Args:
         df (pd.core.frame.DataFrame): The dataframe
         target (str): The chosen pollutant for which it plots the distribution
+
     """
 
     def get_size_down_periods(data_frame, target_column):
-        """Get the size of the downtime periods for the sensor"""
+        """Get the size of the downtime periods for the sensor."""
         gap_distribution = [0] * 4000
         x = []
         i = -1
@@ -511,7 +533,7 @@ def visualize_missing_values_estimation(df: pd.core.frame.DataFrame,
                                     'Longitude', target]])
         example1[f'new{target}'] = imputer.transform(
             example1[['time_discriminator', 'Latitude', 'Longitude', target]])[
-                                   :, 3]
+            :, 3]
         plt.plot(missing_before_after,
                  example1.loc[missing_before_after][f'new{target}'], 'g--o',
                  label='nearest neighbor')
@@ -526,7 +548,7 @@ def visualize_missing_values_estimation(df: pd.core.frame.DataFrame,
         plt.xlabel('Hour of day', fontsize=FONT_SIZE_AXES)
         plt.ylabel(f'{target} concentration', fontsize=FONT_SIZE_AXES)
         plt.title('Estimating missing values', fontsize=FONT_SIZE_TITLE)
-        plt.legend(loc="upper left", fontsize=FONT_SIZE_TICKS)
+        plt.legend(loc='upper left', fontsize=FONT_SIZE_TICKS)
         plt.xticks(fontsize=FONT_SIZE_TICKS)
         plt.yticks(fontsize=FONT_SIZE_TICKS)
         plt.show()
@@ -579,8 +601,7 @@ def create_plot_with_preditions(
         start_date: datetime,
         end_date: datetime
 ):
-    """
-    This function will take the features (x), the target (y) and the model
+    """This function will take the features (x), the target (y) and the model
     and will fit and Evaluate the model.
 
     Args:
@@ -591,6 +612,7 @@ def create_plot_with_preditions(
         target (str): Name of the target column
         start_date (str): minimum date for plotting.
         end_date (str): maximum date for plotting.
+
     """
 
     def draw_example3(sample, station, predicted2, missing_index):
@@ -622,11 +644,11 @@ def create_plot_with_preditions(
 
         imputer = KNNImputer(n_neighbors=1)
         imputer.fit(copy_of_data[
-                        ['time_discriminator', 'Latitude', 'Longitude',
-                         target]])
+            ['time_discriminator', 'Latitude', 'Longitude',
+             target]])
         example1[f'new_{target}'] = imputer.transform(
             example1[['time_discriminator', 'Latitude', 'Longitude', target]])[
-                                    :, 3]
+            :, 3]
 
         plt.plot(missing_before_after,
                  example1.loc[missing_before_after][f'new_{target}'], 'g--o',
@@ -642,7 +664,7 @@ def create_plot_with_preditions(
         plt.xlabel('Index', fontsize=FONT_SIZE_AXES)
         plt.ylabel(f'{target} concentration', fontsize=FONT_SIZE_AXES)
         plt.title('2 days data and predictions', fontsize=FONT_SIZE_TITLE)
-        plt.legend(loc="upper left", fontsize=FONT_SIZE_TICKS)
+        plt.legend(loc='upper left', fontsize=FONT_SIZE_TICKS)
         plt.xticks(fontsize=FONT_SIZE_TICKS)
         plt.yticks(fontsize=FONT_SIZE_TICKS)
 
@@ -687,6 +709,159 @@ def create_plot_with_preditions(
 
     interact(plot_predictions, station=station_selection,
              size=windows_size_selection, start_index=index_selector)
+
+
+def create_heat_map(
+        predictions_xy,
+        df_day: datetime,
+        dlat: float,
+        dlon: float,
+        target_pollutant: str = 'PM2.5',
+        popup_plots: bool = False
+) -> folium.Map:
+    """Creates a heat map of predicted pollutant values based on the
+    neighboring stations.
+
+    Args:
+        predictions_xy (np.ndarray): array containing tuples of coordinates
+        and predicted value
+        df_day (datetime): the day for which to show the heatmap
+        dlat (float): latitude size of grid
+        dlon (float): longitudinal size of grid
+        target_pollutant (str): pollutant for which to show the heatmap
+        popup_plots (bool): Flag whether to show plots on popup or not
+
+    Returns:
+        map_hooray (folium.Map): Heatmap on the map.
+
+    """
+    # Create the map
+    lat_center = np.average(predictions_xy[:, 0])
+    lon_center = np.average(predictions_xy[:, 1])
+
+    map_hooray = folium.Map(location=[lat_center, lon_center], zoom_start=11)
+
+    # List comprehension to make out list of lists
+    predictions = predictions_xy
+    heat_data = predictions
+    ymin = np.min(predictions[:, 2])
+    ymax = np.max(predictions[:, 2])
+
+    max_value_color = 50
+
+    # Create rectangle features for the map to show the interpolated pollution
+    # between the stations
+    for row in heat_data:
+        color = color_producer(target_pollutant, row[2])
+        folium.Rectangle(
+            bounds=[
+                (row[0] - dlat * FACTOR / 2, row[1] - dlon * FACTOR / 2),
+                (row[0] + dlat * FACTOR / 2, row[1] + dlon * FACTOR / 2)
+            ],
+            color=color,
+            stroke=False,
+            fill=True,
+            fill_color=color,
+            fill_opacity=0.5,
+            popup=f'{"{:.2f}".format(row[2])}'
+        ).add_to(map_hooray)
+
+    # Create circle features for the map to show stations
+    fg = folium.FeatureGroup(name='Stations')
+    for index, station in df_day.iterrows():
+        imputed_col = f'{target_pollutant}_imputed_flag'
+        if imputed_col in station and type(station[imputed_col]) == str:
+            bg_color = 'black'
+            interpolated = '\nestimated'
+        else:
+            bg_color = 'white'
+            interpolated = ''
+        if popup_plots:
+            popup_text = f"<img src='img/tmp/{station['Station']}.png'>"
+        else:
+            popup_text = (
+                f"{station['Station']}"
+                f":\n{'{:.2f}'.format(station[target_pollutant])}"
+                f"{interpolated}"
+            )
+        fg.add_child(
+            folium.CircleMarker(
+                location=[station['Latitude'], station['Longitude']],
+                radius=11,
+                fill_color=bg_color,
+                color='',
+                fill_opacity=0.9,
+            )
+        )
+        fg.add_child(
+            folium.CircleMarker(
+                location=[station['Latitude'], station['Longitude']],
+                radius=10,
+                fill_color=color_producer(target_pollutant,
+                                          station[target_pollutant]),
+                color='',
+                fill_opacity=0.9,
+                popup=popup_text
+            )
+        )
+    map_hooray.add_child(fg)
+
+    return map_hooray
+
+
+def create_heat_map_with_date_range(
+        df: pd.core.frame.DataFrame,
+        start_date: datetime,
+        end_date: datetime,
+        k_neighbors: int = 1,
+        target_pollutant: str = 'PM2.5',
+        distance_metric: str = 'sqeuclidean'
+) -> folium.Map:
+    """Creates a heat map of predicted pollutant values based on the
+    neighboring stations.
+
+    Args:
+        df (pd.core.frame.DataFrame): dataframe with data.
+        start_date (datetime): the starting day for which to show the heatmap
+        end_date (datetime): the end day for which to show the heatmap
+        k_neighbors (int): number of neighbors to use for interpolation
+        target_pollutant (str): pollutant for which to show the heatmap
+        distance_metric (str): The metric to use to calculate the distance
+        between the stations.
+
+    Returns:
+        map_hooray (folium.Map): Heatmap on the map.
+
+    """
+    df_days = df[df['DateTime'] >= start_date]
+    df_days = df_days[df_days['DateTime'] <= end_date]
+
+    for key in df_days.Station.unique():
+        dates = df_days[df_days['Station'] == key]['DateTime']
+        plt.plot(dates, df_days[df_days['Station'] == key][target_pollutant],
+                 '-o')
+        plt.plot(dates, [12] * len(dates), '--g', label='recommended level')
+        plt.title(f'Station {key}')
+        plt.xlabel('hour')
+        plt.ylabel(f'{target_pollutant} concentration')
+        plt.legend(loc='upper left')
+        plt.xticks(rotation=30)
+        plt.savefig(f'img/tmp/{key}.png')
+        plt.clf()
+
+    k = k_neighbors
+    neigh = KNeighborsRegressor(n_neighbors=k, weights='distance',
+                                metric=distance_metric)
+    # Filter a single time step
+    df_day = df_days[df_days['DateTime'] == end_date]
+    neigh.fit(df_day[['Latitude', 'Longitude']], df_day[[target_pollutant]])
+
+    predictions_xy, dlat, dlon = predict_on_bogota(neigh, 64)
+
+    map_hooray = create_heat_map(predictions_xy, df_day, dlat, dlon,
+                                 target_pollutant, popup_plots=True)
+
+    return map_hooray
 
 
 # The functions from here are helper functions,
@@ -772,3 +947,207 @@ def color_producer(pollutant_type, pollutant_value):
             pin_color = str(colors[int(np.round(bucket*10))])
             return pin_color
         previous = threshold
+
+
+def predict_on_bogota(
+        model: KNeighborsRegressor,
+        n_points: int = 64
+) -> Tuple[np.ndarray, float, float]:
+    """ Creates a grid of predicted pollutant values based on the neighboring s
+    tations
+
+    Args:
+        model (KNeighborsRegressor): Model to use
+        n_points (int): number of points in the grid
+
+    Returns:
+        predictions_xy (np.ndarray): array containing tuples of coordinates and
+        predicted value
+        dlat (float): latitude size of grid
+        dlon (float): longitudinal size of grid
+    """
+    with open('data/bogota.json') as f:
+        js = json.load(f)
+
+    # Check each polygon to see if it contains the point
+    polygon = Polygon(shape(js['features'][0]['geometry']))
+    (lon_min, lat_min, lon_max, lat_max) = polygon.bounds
+
+    dlat = (lat_max - lat_min) / (n_points - 1)
+    dlon = (lon_max - lon_min) / (n_points - 1)
+    lat_values = np.linspace(lat_min - dlat, lat_max + dlat, n_points)
+    lon_values = np.linspace(lon_min - dlon, lon_max + dlon, n_points)
+    xv, yv = np.meshgrid(lat_values, lon_values, indexing='xy')
+
+    predictions_xy = []
+
+    for i in range(n_points):
+        row = [0] * n_points
+        for j in range(n_points):
+            if polygon.contains(Point(lon_values[j], lat_values[i])):
+                point = [lat_values[i], lon_values[j]]
+                # Remove the data of the same station
+                pred = model.predict([point])
+                predictions_xy.append(
+                    [lat_values[i], lon_values[j], pred[0][0]])
+
+    predictions_xy = np.array(predictions_xy)
+
+    return predictions_xy, dlat, dlon
+
+
+def create_animation_features(
+        df: pd.core.frame.DataFrame,
+        start_date: datetime,
+        end_date: datetime,
+        k: int,
+        n_points: int,
+        target_pollutant='PM2.5'
+) -> List[Dict[str, Any]]:
+    """Creates features to put on the animated map.
+
+    Args:
+        df (pd.core.frame.DataFrame): dataframe with data.
+        start_date (datetime): the starting day for which to show the heatmap
+        end_date (datetime): the end day for which to show the heatmap
+        k (int): number of neighbors to use for interpolation
+        n_points (int): number of points in the grid
+        target_pollutant (str): pollutant for which to show the heatmap
+
+    Returns:
+        features (List[Dict[str, Any]]): List of features.
+
+    """
+    # Select the date range from the full dataframe
+    df_days = df[df['DateTime'] >= start_date]
+    df_days = df_days[df_days['DateTime'] <= end_date]
+    # Take all the unique dates (steps for the animation)
+    unique_dates = df_days['DateTime'].unique()
+    # Select only relevant columns
+    df_days = df_days[
+        ['DateTime', 'Station', 'Latitude', 'Longitude', target_pollutant]]
+    # Create a list to store all of the features (elements) of the animation
+    features = []
+
+    k_neighbors_model = KNeighborsRegressor(n_neighbors=k, weights='distance',
+                                            metric='sqeuclidean')
+
+    for timestamp in unique_dates:
+        df_day = df[df['DateTime'] == timestamp]
+
+        day_hour = str(timestamp)[0:19]
+        k_neighbors_model.fit(df_day[['Latitude', 'Longitude']],
+                              df_day[[target_pollutant]])
+        predictions_xy, dlat, dlon = predict_on_bogota(k_neighbors_model,
+                                                       n_points)
+
+        for row in predictions_xy:
+            rect = create_polygon(row, dlat, dlon, day_hour, target_pollutant)
+            features.append(rect)
+
+        for index, station in df_day.iterrows():
+            imputed_col = f'{target_pollutant}_imputed_flag'
+            if imputed_col in station and type(station[imputed_col]) == str:
+                bg_color = 'black'
+            else:
+                bg_color = 'white'
+            data = [station['Latitude'], station['Longitude'],
+                    station[target_pollutant]]
+            circle = create_circle(data, day_hour, 13, target_pollutant,
+                                   bg_color)
+            features.append(circle)
+            circle = create_circle(data, day_hour, 12, target_pollutant)
+            features.append(circle)
+
+    return features
+
+
+def create_polygon(
+        p: List[float],
+        dlat: float,
+        dlon: float,
+        time: datetime,
+        pollutant: str
+) -> Dict[str, Any]:
+    """Given the parameters it creates a dictionary with information for the
+    polygon feature.
+
+    Args:
+        p (List[float]): list of coordinates
+        dlat (float): latitude size of grid
+        dlon (float): longitudinal size of grid
+        time (datetime): time for which the polygon is valid
+        pollutant (str): pollutant which the polygon represents
+
+    Returns:
+        feature (Dict[str, Any]): dictionary of the feature properties.
+
+    """
+    # Create a polygon feature for the map
+    feature = {
+        'type': 'Feature',
+        'geometry': {
+            'type': 'Polygon',
+            'coordinates': [
+                [[p[1] - dlon * FACTOR / 2, p[0] - dlat * FACTOR / 2],
+                 [p[1] - dlon * FACTOR / 2, p[0] + dlat * FACTOR / 2],
+                 [p[1] + dlon * FACTOR / 2, p[0] + dlat * FACTOR / 2],
+                 [p[1] + dlon * FACTOR / 2, p[0] - dlat * FACTOR / 2],
+                 [p[1] - dlon * FACTOR / 2, p[0] - dlat * FACTOR / 2]]],
+
+        },
+        'properties': {
+            'times': [time],
+            'style': {
+                'color': color_producer(pollutant, p[2]),
+                'stroke': False,
+                'fillOpacity': 0.4
+            }
+        }
+    }
+    return feature
+
+
+def create_circle(
+        p: List[float],
+        day_hour: datetime,
+        radius: float,
+        pollutant: str,
+        color: Optional[str] = None
+) -> Dict[str, Any]:
+    """Given the parameters it creates a dictionary with information for the
+    circle feature.
+
+    Args:
+        p (List[float]): list of coordinates
+        day_hour (datetime): time for which the polygon is valid
+        radius (float): size of the circle
+        pollutant (str): pollutant which the polygon represents
+        color (Optional[str]): color of the circle
+
+    Returns:
+        feature (Dict[str, Any]): dictionary of the feature properties.
+
+    """
+    if color is None:
+        color = color_producer(pollutant, p[2])
+
+    feature = {
+        'type': 'Feature',
+        'geometry': {
+            'type': 'Point',
+            'coordinates': [p[1], p[0]],
+        },
+        'properties': {
+            'time': day_hour,
+            'icon': 'circle',
+            'iconstyle': {
+                'fillColor': color,
+                'fillOpacity': 1,
+                'stroke': 'false',
+                'radius': radius,
+            },
+            'style': {'weight': 0},
+        },
+    }
+    return feature
